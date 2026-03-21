@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+
+		"moduleDetection": "force",
+		"lib": [
+            "esnext"
+        ],
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+		"resolveJsonModule": true,
+        "allowArbitraryExtensions": true,
+        "allowImportingTsExtensions": true,
+        "noEmit": true,
+        "verbatimModuleSyntax": true,
+		"allowJs": true,
+		"esModuleInterop": true,
+		"isolatedModules": true,
+	},
+}
