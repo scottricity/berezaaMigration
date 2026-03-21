@@ -10,10 +10,20 @@ import {
 
 process.loadEnvFile("./.env")
 
-const minRequestsNeeded = 6
-
 const apiKey = process.env.API_KEY as string
-const universeId = "9332753070" as string
+const universeId = "2603171363" as string
+
+const ignoredStores = [
+    "DataRollbackVersionV10",
+    "DataRollbackVersionV8",
+    "OfficialDatastore",
+    "PlayerDataV2",
+    "____PS",
+    "ModerationDataVersion1",
+    "__global__3a0c3317-5845-4d63-bd11-1acc26b8a6c3-1"
+]
+
+const minRequestsNeeded = 6
 
 const slotArray = Array.from({ length: 5 })
 const cache = new Map<string, Set<number>>()
@@ -115,11 +125,56 @@ function addCache(userId: string | number, slot: number) {
     return true
 }
 
+async function* iterateUserStores() {
+    let cursor: string | undefined = undefined
+
+    while (true) {
+        await ensureMinRequestsAvailable(minRequestsNeeded)
+        const res = await client.GET(
+            "/cloud/v2/universes/{universe_id}/data-stores",
+            {
+                params: {
+                    path: {
+                        universe_id: universeId,
+                    },
+                    query: {
+                        maxPageSize: 100,
+                        showDeleted: false,
+                        pageToken: cursor
+                    }
+                }
+            }
+        )
+        if (res.response) recordRateLimitFromResponse(res.response)
+
+        if (res.error) {
+            throw res.error
+        }
+
+        const data = res.data
+
+        for (const entry of data.dataStores) {
+            const id = parseInt(entry.id)
+
+            // ❌ skip if not a valid integer
+            if (!Number.isInteger(id)) continue
+
+            if (ignoredStores.includes(entry.id)) continue
+
+            yield id
+        }
+
+        if (!data.nextPageToken) break
+
+        cursor = data.nextPageToken
+    }
+}
+
 async function* iterateUsersToMigrate() {
     let cursor: string | undefined = undefined
 
     while (true) {
-        await ensureMinRequestsAvailable(1)
+        await ensureMinRequestsAvailable(minRequestsNeeded)
         const res = await client.GET(
             "/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/entries",
             {
@@ -131,7 +186,7 @@ async function* iterateUsersToMigrate() {
                     query: {
                         maxPageSize: 100,
                         showDeleted: false,
-                        cursor
+                        pageToken: cursor
                     }
                 }
             }
@@ -155,7 +210,7 @@ async function* iterateUsersToMigrate() {
 }
 
 async function getMostRecentSaves(userId: number | string, slot: number) {
-    await ensureMinRequestsAvailable(1)
+    await ensureMinRequestsAvailable(minRequestsNeeded)
     const res = await client.GET("/cloud/v2/universes/{universe_id}/ordered-data-stores/{ordered_data_store_id}/scopes/{scope_id}/entries", {
         params: {
             path: {
@@ -186,7 +241,7 @@ async function getMostRecentSaves(userId: number | string, slot: number) {
 }
 
 async function getSlotData(timestamp: number | string, userId: number | string, slot: number) {
-    await ensureMinRequestsAvailable(1)
+    await ensureMinRequestsAvailable(minRequestsNeeded)
     const res = await client.GET("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/scopes/{scope_id}/entries/{entry_id}", {
         params: {
             path: {
@@ -218,7 +273,10 @@ async function migrateIfNeeded(userId: string | number, slot: number) {
     if (oldData && oldData?.errorCode == 9) return "INVALID_JSON";
     if (!oldData?.data) return "NO_DATA";
 
-    await ensureMinRequestsAvailable(1)
+    await ensureMinRequestsAvailable(minRequestsNeeded)
+    if (slot == 0) {
+        slot = 1
+    }
     const res = await client.POST("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/entries", {
         params: {
             path: {
@@ -233,13 +291,11 @@ async function migrateIfNeeded(userId: string | number, slot: number) {
             attributes: {
                 ["Origin"]: "OpenCloud"
             } as any,
-            value: JSON.stringify(oldData),
+            value: oldData.data,
             users: [`users/${userId.toString()}`],
         }
     })
     if (res.response) recordRateLimitFromResponse(res.response)
-
-    console.log(parseRateLimitRemaining(res.response))
 
     if (((res.error as any)?.code) == 3) {
         return "EXISTS"
@@ -249,7 +305,7 @@ async function migrateIfNeeded(userId: string | number, slot: number) {
 }
 
 async function deleteStore(userId: string | number) {
-    await ensureMinRequestsAvailable(1)
+    await ensureMinRequestsAvailable(minRequestsNeeded)
     const res = await client.DELETE("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}", {
         params: {
             path: {
@@ -277,16 +333,16 @@ const STATUS_COLORS = {
 }
 
 function safePersist(reason: string, err?: unknown) {
-  try {
-    console.log(chalk.red(`\n[CRASH] Saving cache due to: ${reason}`))
-    if (err) console.error(err)
+    try {
+        console.log(chalk.red(`\n[CRASH] Saving cache due to: ${reason}`))
+        if (err) console.error(err)
 
-    persist()
+        persist()
 
-    console.log(chalk.green("[CRASH] Cache saved successfully"))
-  } catch (e) {
-    console.error("[CRASH] Failed to save cache:", e)
-  }
+        console.log(chalk.green("[CRASH] Cache saved successfully"))
+    } catch (e) {
+        console.error("[CRASH] Failed to save cache:", e)
+    }
 }
 
 async function run() {
@@ -298,13 +354,12 @@ async function run() {
         if (cached && cached.size == slotArray.length) continue;
         console.log(`Attempting migration for userId ${userId}`)
         for (const slotStr in slotArray) {
-            const slot = parseInt(slotStr) + 1
+            const slot = Number(slotStr) + 1
             if (cached.has(slot)) continue;
             const status = await migrateIfNeeded(userId, slot)
 
             if (status == "INVALID_JSON") {
                 logCorruptedKey(userId, slot, "INVALID")
-                addCache(userId, slot)
                 errored = true
                 continue
             }
@@ -316,36 +371,68 @@ async function run() {
             console.log(`[${userId}${getSlotSuffix(slot)}]: ${STATUS_COLORS[status](status)}`)
         }
 
+        persist()
+
         const deleted = await deleteStore(userId)
         if (deleted && !errored) {
             console.log(`${chalk.green("Migrated")} ${userId} ${chalk.green('successfully')}.`)
         }
     }
 
-    persist()
+    console.log("Attempting to migrate userId stores.")
+    for await (const userId of iterateUserStores()) {
+        let errored = false;
+        let cached = cache.get(userId.toString()) || new Set()
+        if (cached && cached.size == slotArray.length) continue;
+        console.log(`Attempting migration for userId ${userId}`)
+        for (const slotStr in slotArray) {
+            const slot = Number(slotStr) + 1
+            if (cached.has(slot)) continue;
+            const status = await migrateIfNeeded(userId, slot)
+
+            if (status == "INVALID_JSON") {
+                logCorruptedKey(userId, slot, "INVALID")
+                errored = true
+                continue
+            }
+
+            if (status == "MIGRATED" || status == "EXISTS" || status == "NO_DATA") {
+                addCache(userId, slot)
+            }
+
+            console.log(`[${userId}${getSlotSuffix(slot)}]: ${STATUS_COLORS[status](status)}`)
+        }
+
+        persist()
+
+        const deleted = await deleteStore(userId)
+        if (deleted && !errored) {
+            console.log(`${chalk.green("Migrated")} ${userId} ${chalk.green('successfully')}.`)
+        }
+    }
 }
 
 process.on("SIGINT", () => {
-  safePersist("SIGINT (Ctrl+C)")
-  process.exit(0)
+    safePersist("SIGINT (Ctrl+C)")
+    process.exit(0)
 })
 
 // kill signal
 process.on("SIGTERM", () => {
-  safePersist("SIGTERM")
-  process.exit(0)
+    safePersist("SIGTERM")
+    process.exit(0)
 })
 
 // uncaught sync errors
 process.on("uncaughtException", (err) => {
-  safePersist("uncaughtException", err)
-  process.exit(1)
+    safePersist("uncaughtException", err)
+    process.exit(1)
 })
 
 // unhandled async errors
 process.on("unhandledRejection", (err) => {
-  safePersist("unhandledRejection", err)
-  process.exit(1)
+    safePersist("unhandledRejection", err)
+    process.exit(1)
 })
 
 run()
