@@ -1,110 +1,63 @@
-export type RateLimitHeaderSource =
-    | Headers
-    | Response
-    | { headers: Headers }
-    | Record<string, string | string[] | undefined>;
+export class SharedRateLimiter {
+  private cooldownUntil = 0
+  private nextAvailableAt = 0
+  private readonly minIntervalMs: number
 
-const sleep = (ms: number) =>
-    new Promise<void>((resolve) => setTimeout(resolve, ms));
+  constructor(requestsPerSecond: number) {
+    this.minIntervalMs = Math.ceil(1000 / requestsPerSecond)
+  }
 
-function headerValue(
-    source: RateLimitHeaderSource,
-    name: string
-): string | null {
-    const lower = name.toLowerCase();
-    if (source instanceof Headers) {
-        return source.get(lower) ?? source.get(name);
+  async waitTurn() {
+    while (true) {
+      const now = Date.now()
+
+      if (now < this.cooldownUntil) {
+        await sleep(this.cooldownUntil - now)
+        continue
+      }
+
+      if (now < this.nextAvailableAt) {
+        await sleep(this.nextAvailableAt - now)
+        continue
+      }
+
+      this.nextAvailableAt = Date.now() + this.minIntervalMs
+      return
     }
-    if (typeof source === "object" && source !== null && "headers" in source) {
-        const h = (source as { headers: Headers }).headers;
-        if (h instanceof Headers) {
-            return h.get(lower) ?? h.get(name);
-        }
+  }
+
+  async updateFromHeaders(headers: Headers) {
+    const remaining = Number(headers.get("x-ratelimit-remaining") ?? 0)
+    const resetSeconds = Number(headers.get("x-ratelimit-reset") ?? 0)
+
+    if (remaining < 6 && resetSeconds > 0) {
+      const until = Date.now() + resetSeconds * 1000
+      this.cooldownUntil = Math.max(this.cooldownUntil, until)
+
+      console.log(
+        `[RateLimit] remaining=${remaining}, cooldown ${resetSeconds}s`
+      )
     }
-    if (typeof source === "object" && source !== null) {
-        const rec = source as Record<string, string | string[] | undefined>;
-        for (const [k, v] of Object.entries(rec)) {
-            if (k.toLowerCase() !== lower || v == null) continue;
-            return Array.isArray(v) ? (v[0] ?? null) : v;
-        }
-    }
-    return null;
+  }
 }
 
-export function parseRateLimitRemaining(source: RateLimitHeaderSource): number | null {
-    const raw = headerValue(source, "x-ratelimit-remaining");
-    if (raw == null || raw === "") return null;
-    const n = Number.parseInt(raw.split(",")[0].trim(), 10);
-    return Number.isFinite(n) ? n : null;
+function sleep(ms: number) {
+  return new Promise((res) => setTimeout(res, ms))
 }
 
-export function parseRateLimitResetSeconds(source: RateLimitHeaderSource): number | null {
-    const raw = headerValue(source, "x-ratelimit-reset");
-    if (raw == null || raw === "") return null;
-    const n = Number.parseFloat(raw.split(",")[0].trim());
-    return Number.isFinite(n) && n >= 0 ? n : null;
+type RateLimiter = {
+  waitTurn: () => Promise<void>
+  updateFromHeaders: (headers: Headers) => Promise<void>
 }
 
-type RateSnapshot = {
-    remaining: number;
-    resetDeadlineMs: number;
-};
+export function createRateLimitedFetch(limiter: RateLimiter): typeof fetch {
+  return async (input, init) => {
+    await limiter.waitTurn()
 
-let snapshot: RateSnapshot | null = null;
+    const res = await fetch(input, init)
 
-const RESET_BUFFER_MS = 250;
+    await limiter.updateFromHeaders(res.headers)
 
-export function recordRateLimitFromResponse(source: RateLimitHeaderSource): void {
-    const remaining = parseRateLimitRemaining(source);
-    if (remaining === null) return;
-    const resetSec = parseRateLimitResetSeconds(source);
-    const resetDeadlineMs =
-        resetSec !== null
-            ? Date.now() + resetSec * 1000 + RESET_BUFFER_MS
-            : Date.now() + 60_000;
-    snapshot = { remaining, resetDeadlineMs };
-}
-
-export async function ensureMinRequestsAvailable(
-  minAvailable = 4
-): Promise<void> {
-  if (!snapshot || snapshot.remaining >= minAvailable) return;
-
-  const waitMs = Math.max(0, snapshot.resetDeadlineMs - Date.now());
-
-  console.log(`[RateLimit] Waiting ${waitMs}ms`);
-  await sleep(waitMs);
-
-  // ✅ DO NOT NULL IT
-  snapshot = {
-    remaining: minAvailable,
-    resetDeadlineMs: Date.now() + 1000
-  };
-}
-
-export async function waitIfBelowMinFromHeaders(
-    source: RateLimitHeaderSource,
-    minAvailable = 4
-): Promise<void> {
-    const remaining = parseRateLimitRemaining(source);
-    if (remaining === null || remaining >= minAvailable) return;
-    const resetSec = parseRateLimitResetSeconds(source);
-    const ms =
-        resetSec !== null
-            ? resetSec * 1000 + RESET_BUFFER_MS
-            : 60_000 + RESET_BUFFER_MS;
-    await sleep(ms);
-}
-
-export function withRobloxMinRateLimit<
-    A extends unknown[],
-    R extends Response,
->(fn: (...args: A) => Promise<R>, minAvailable = 4): (...args: A) => Promise<R> {
-    return async (...args: A) => {
-        await ensureMinRequestsAvailable(minAvailable);
-        const res = await fn(...args);
-        recordRateLimitFromResponse(res);
-        await ensureMinRequestsAvailable(minAvailable);
-        return res;
-    };
+    return res
+  }
 }

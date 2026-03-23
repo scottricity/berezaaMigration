@@ -42,6 +42,11 @@ node_modules
 node_modules/
 jspm_packages/
 
+# Runtime logs
+migrations.txt
+errors.txt
+deleted.txt
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 
