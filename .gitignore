@@ -44,6 +44,7 @@ jspm_packages/
 
 # Runtime logs
 migrations.txt
+migrations2.txt
 errors.txt
 deleted.txt
 
