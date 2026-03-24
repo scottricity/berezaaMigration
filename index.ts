@@ -4,15 +4,16 @@ import chalk from "chalk";
 import fs from "fs";
 import {
     createRateLimitedFetch,
-    SharedRateLimiter
+    SharedRateLimiter,
+    sleep
 } from "./rate-limit.ts";
 
 import {
-    addSlot,
+    cacheUser,
+    isUserCached,
+    userCache,
     loadCache,
     saveCache,
-    isCached,
-    isUserComplete,
     loadErrors,
     logError,
     loadDeleted,
@@ -45,13 +46,26 @@ const ignoredStores = [
 
 const slotArray = ["1", "2", "3", "4", "5"]
 
-const limiter = new SharedRateLimiter(5);
-const client = createClient<paths>({
-    headers: {
-        ['x-api-key']: apiKey
-    },
+const readLimiter = new SharedRateLimiter(166);   // ~10k/min
+const writeLimiter = new SharedRateLimiter(33);   // ~2k/min
+const deleteLimiter = new SharedRateLimiter(166); // ~10k/min
+
+const readClient = createClient<paths>({
+    headers: { ['x-api-key']: apiKey },
     baseUrl: "https://apis.roblox.com",
-    fetch: createRateLimitedFetch(limiter)
+    fetch: createRateLimitedFetch(readLimiter)
+});
+
+const writeClient = createClient<paths>({
+    headers: { ['x-api-key']: apiKey },
+    baseUrl: "https://apis.roblox.com",
+    fetch: createRateLimitedFetch(writeLimiter)
+});
+
+const deleteClient = createClient<paths>({
+    headers: { ['x-api-key']: apiKey },
+    baseUrl: "https://apis.roblox.com",
+    fetch: createRateLimitedFetch(deleteLimiter)
 });
 
 function toSuffix(slot: number) {
@@ -80,7 +94,7 @@ async function* iterateUserIdStores(filter?: string) {
     let cursor: string | undefined = undefined
 
     while (true) {
-        const res = await client.GET(
+        const res = await readClient.GET(
             "/cloud/v2/universes/{universe_id}/data-stores",
             {
                 params: {
@@ -125,7 +139,7 @@ async function* iterateUsersToMigrate() {
     let cursor: string | undefined = undefined
 
     while (true) {
-        const res = await client.GET(
+        const res = await readClient.GET(
             "/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/entries",
             {
                 params: {
@@ -163,7 +177,7 @@ async function* iterateUsersToMigrate() {
 }
 
 async function getMostRecentSaves(userId: number | string, slot: number) {
-    const res = await client.GET("/cloud/v2/universes/{universe_id}/ordered-data-stores/{ordered_data_store_id}/scopes/{scope_id}/entries", {
+    const res = await readClient.GET("/cloud/v2/universes/{universe_id}/ordered-data-stores/{ordered_data_store_id}/scopes/{scope_id}/entries", {
         params: {
             path: {
                 universe_id: universeId,
@@ -191,7 +205,7 @@ async function getMostRecentSaves(userId: number | string, slot: number) {
 }
 
 async function getSlotData(timestamp: number | string, userId: number | string, slot: number) {
-    const res = await client.GET("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/scopes/{scope_id}/entries/{entry_id}", {
+    const res = await readClient.GET("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/scopes/{scope_id}/entries/{entry_id}", {
         params: {
             path: {
                 universe_id: universeId,
@@ -226,7 +240,7 @@ async function migrateIfNeeded(userId: string | number, slot: number) {
         slot = 1
     }
 
-    const res = await client.POST("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/entries", {
+    const res = await writeClient.POST("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}/entries", {
         params: {
             path: {
                 universe_id: universeId,
@@ -255,7 +269,7 @@ async function migrateIfNeeded(userId: string | number, slot: number) {
 }
 
 async function deleteStore(userId: string | number) {
-    const res = await client.DELETE("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}", {
+    const res = await deleteClient.DELETE("/cloud/v2/universes/{universe_id}/data-stores/{data_store_id}", {
         params: {
             path: {
                 universe_id: universeId,
@@ -280,58 +294,202 @@ const STATUS_COLORS = {
     ["EXISTS"]: chalk.yellow,
     ["NO_DATA"]: chalk.red
 }
+const deleteQueue: (string | number)[] = []
+
+const DELETE_CONCURRENCY = 10
+
+let activeDeletes = 0
+let resolveDrain: (() => void) | null = null
+
+async function handleDelete(userId: string) {
+    try {
+        const didDelete = await deleteStore(userId)
+
+        if (didDelete) {
+            cacheDelete(userId)
+            console.log(`🗑️ Deleted ${userId}`)
+        } else {
+            console.log(`⚠️ Failed delete ${userId}`)
+        }
+    } catch (err) {
+        console.warn(`Delete error ${userId}`, err)
+    }
+}
+
+function enqueueDelete(userId: string | number) {
+    deleteQueue.push(userId)
+    processDeleteQueue()
+}
+
+function processDeleteQueue() {
+    while (activeDeletes < DELETE_CONCURRENCY && deleteQueue.length > 0) {
+        const userId = deleteQueue.shift()
+        if (!userId) continue
+
+        activeDeletes++
+
+        handleDelete(userId.toString())
+            .catch(console.error)
+            .finally(() => {
+                activeDeletes--
+
+                // continue processing immediately
+                processDeleteQueue()
+
+                // resolve drain if finished
+                if (activeDeletes === 0 && deleteQueue.length === 0 && resolveDrain) {
+                    resolveDrain()
+                    resolveDrain = null
+                }
+            })
+    }
+}
+
+async function drainDeletes() {
+    if (activeDeletes === 0 && deleteQueue.length === 0) return
+
+    return new Promise<void>((resolve) => {
+        resolveDrain = resolve
+    })
+}
+
+let migratedCount = 0
+
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK!
+
+async function sendWebhookEmbed(data: {
+    title?: string
+    description?: string
+    color?: number
+    fields?: { name: string; value: string; inline?: boolean }[]
+}) {
+    try {
+        await fetch(WEBHOOK_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                embeds: [
+                    {
+                        title: data.title,
+                        description: data.description,
+                        color: data.color ?? 0x00ff00,
+                        fields: data.fields ?? [],
+                        timestamp: new Date().toISOString()
+                    }
+                ]
+            })
+        })
+    } catch (err) {
+        console.warn("Webhook failed:", err)
+    }
+}
+
+let startTime = Date.now()
+async function onMilestone(count: number) {
+    console.log(`🎉 Milestone reached: ${count} users migrated`)
+    const elapsed = (Date.now() - startTime) / 1000
+    const rate = count / elapsed
+
+    await sendWebhookEmbed({
+        title: "🚀 Migration Milestone",
+        description: `Reached **${count.toLocaleString()} users**`,
+        color: 0x00ff00,
+        fields: [
+            {
+                name: "Speed",
+                value: `${rate.toFixed(2)} users/sec`,
+                inline: true
+            },
+            {
+                name: "Elapsed",
+                value: `${elapsed.toFixed(1)}s`,
+                inline: true
+            },
+        ]
+    })
+}
+
+function incrementAndCheckMilestone() {
+    migratedCount++
+
+    if (migratedCount % 50_000 === 0) {
+        onMilestone(migratedCount)
+    }
+}
 
 async function processUser(userId: string) {
-    if (isUserComplete(userId)) return
+    if (isUserCached(userId)) return
 
-    console.log(`MIGRATING ${userId}`)
+    const start = Date.now()
 
-    let errored = false
-
-    await Promise.all(
+    const results = await Promise.all(
         slotArray.map(async (_, i) => {
             const slot = i + 1
-            if (isCached(userId, slot)) return
 
-            addSlot(userId, slot)
+            try {
+                const status = await migrateIfNeeded(userId, slot)
 
-            const status = await migrateIfNeeded(userId, slot)
+                if (status === "INVALID") {
+                    logError(`${userId}-${slot}`, status)
+                    return "INVALID"
+                }
 
-            if (status === "INVALID") {
-                logError(`${userId}-${slot}`, status)
-                errored = true
-                return
+                return status
+            } catch (error) {
+                console.warn(`Error migrating ${userId}-${slot}`, error)
+                return "ERROR"
             }
         })
     )
 
+    const errored = results.includes("INVALID") || results.includes("ERROR")
+    const totalTime = Date.now() - start
+
     if (!errored) {
-        await deleteStore(userId)
+        cacheUser(userId)
+        enqueueDelete(userId)
+        incrementAndCheckMilestone()
+        console.log(`✅ MIGRATED ${userId} (${totalTime}ms)`)
+    } else {
+        console.log(`⚠️ PARTIAL ${userId} (${totalTime}ms)`)
     }
 }
 
 const concurrency = 5
-const workers: Promise<void>[] = []
 
 async function run() {
     await loadCache()
     await loadDeleted()
     await loadErrors()
 
-    for await (const userId of iterateUsersToMigrate()) {
-        const p = processUser(userId)
-        workers.push(p)
+    migratedCount = userCache.size
 
-        if (workers.length >= concurrency) {
-            await Promise.race(workers)
-            workers.splice(workers.findIndex(w => w === p), 1)
+    const iterator = iterateUsersToMigrate()
+
+    const workers = Array.from({ length: concurrency }, async () => {
+        for await (const userId of iterator) {
+            if (isUserCached(userId)) continue
+
+            try {
+                await processUser(userId)
+            } catch (err) {
+                console.error(`Worker error for ${userId}`, err)
+            }
         }
-    }
+    })
 
     await Promise.all(workers)
+
+    console.log("Draining deletes...")
+    await drainDeletes()
 }
 
 process.on("SIGINT", async () => {
+    console.log("Draining deletes...")
+    await drainDeletes()
+
     await flushNow()
     await saveCache()
     await saveErrors()

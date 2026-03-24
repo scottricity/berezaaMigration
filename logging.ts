@@ -4,8 +4,9 @@ const errorFile = "./errors.txt"
 const migrationFile = "./migrations.txt"
 const deletionFile = "./deleted.txt"
 
-// userId -> Set<slot>
-export const cache = new Map<string, Set<number>>()
+// ✅ Only track completed users
+export const userCache = new Set<string>()
+
 let errorCache: string[] = []
 export const deleted = new Set<string | number>()
 
@@ -56,6 +57,28 @@ export async function flushNow() {
     await flush()
 }
 
+// --------------------
+// LOAD
+// --------------------
+
+export async function loadCache() {
+    try {
+        const raw = await fs.readFile(migrationFile, "utf8")
+        const rows = raw.split(/\r?\n/)
+
+        for (const row of rows) {
+            if (!row) continue
+
+            // ✅ handle both formats
+            const userId = row.includes(";")
+                ? row.split(";")[0]
+                : row.trim()
+
+            userCache.add(userId)
+        }
+    } catch {}
+}
+
 export async function loadErrors() {
     try {
         const raw = await fs.readFile(errorFile, "utf8")
@@ -74,46 +97,16 @@ export async function loadDeleted() {
     } catch {}
 }
 
-export async function loadCache() {
-    try {
-        const raw = await fs.readFile(migrationFile, "utf8")
-        const rows = raw.split(/\r?\n/)
+// --------------------
+// WRITE
+// --------------------
 
-        for (const row of rows) {
-            if (!row) continue
+export function cacheUser(userId: string) {
+    if (userCache.has(userId)) return
 
-            const parts = row.split(";")
-            const userId = parts[0]
+    userCache.add(userId)
 
-            let slots = cache.get(userId)
-            if (!slots) {
-                slots = new Set()
-                cache.set(userId, slots)
-            }
-
-            for (let i = 1; i < parts.length; i++) {
-                const slot = Number(parts[i])
-                if (!Number.isNaN(slot)) {
-                    slots.add(slot)
-                }
-            }
-        }
-    } catch {}
-}
-
-export function addSlot(userId: string, slot: number) {
-    let slots = cache.get(userId)
-
-    if (!slots) {
-        slots = new Set()
-        cache.set(userId, slots)
-    }
-
-    if (slots.has(slot)) return
-
-    slots.add(slot)
-
-    migrationBuffer.push(`${userId};${slot}\n`)
+    migrationBuffer.push(`${userId}\n`)
 }
 
 export function logError(key: string, reason: string) {
@@ -127,24 +120,23 @@ export function cacheDelete(key: string) {
     deletionBuffer.push(`${key}\n`)
 }
 
-export function isCached(userId: string, slot: number) {
-    const slots = cache.get(userId)
-    return slots ? slots.has(slot) : false
+// --------------------
+// CHECKS
+// --------------------
+
+export function isUserCached(userId: string) {
+    return userCache.has(userId)
 }
 
-export function isUserComplete(userId: string) {
-    const slots = cache.get(userId)
-    return slots ? slots.size === 5 : false
-}
+// --------------------
+// FULL SAVE (fallback)
+// --------------------
 
 export async function saveCache() {
-    const lines: string[] = []
-
-    for (const [userId, slots] of cache) {
-        lines.push([userId, ...slots].join(";"))
-    }
-
-    await fs.writeFile(migrationFile, lines.join("\n"))
+    await fs.writeFile(
+        migrationFile,
+        [...userCache].join("\n")
+    )
 }
 
 export async function saveErrors() {
